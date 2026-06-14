@@ -1,12 +1,12 @@
 import os
-import anthropic
+from groq import Groq
 from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
 from telegram.ext import ApplicationBuilder, CommandHandler, MessageHandler, CallbackQueryHandler, filters, ContextTypes
 
-ANTHROPIC_API_KEY = os.environ["ANTHROPIC_API_KEY"]
+GROQ_API_KEY = os.environ["GROQ_API_KEY"]
 TELEGRAM_TOKEN = os.environ["TELEGRAM_TOKEN"]
 
-anthropic_client = anthropic.Anthropic(api_key=ANTHROPIC_API_KEY)
+groq_client = Groq(api_key=GROQ_API_KEY)
 
 MODE_PROMPTS = {
     "learn": """Ты репетитор по английскому словарному запасу. Когда пользователь называет слово или просит научить — дай:
@@ -160,13 +160,12 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await context.bot.send_chat_action(chat_id=update.effective_chat.id, action="typing")
 
     try:
-        response = anthropic_client.messages.create(
-            model="claude-sonnet-4-6",
+        response = groq_client.chat.completions.create(
+            model="llama-3.3-70b-versatile",
             max_tokens=1000,
-            system=system_prompt,
-            messages=session["history"],
+            messages=[{"role": "system", "content": system_prompt}] + session["history"],
         )
-        reply = response.content[0].text
+        reply = response.choices[0].message.content
         session["history"].append({"role": "assistant", "content": reply})
         await update.message.reply_text(reply, reply_markup=main_keyboard())
     except Exception as e:
