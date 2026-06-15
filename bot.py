@@ -1,14 +1,12 @@
 import os
 import json
 import random
-from datetime import datetime
 from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
 from telegram.ext import (
     Application, CommandHandler, MessageHandler,
     CallbackQueryHandler, ContextTypes, filters
 )
 
-# ─── Config ────────────────────────────────────────────────────────────────────
 TOKEN = os.environ["TELEGRAM_TOKEN"]
 DATA_FILE = "data.json"
 
@@ -39,10 +37,17 @@ async def cmd_start(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         name = student["name"]
         await update.message.reply_text(
             f"👋 С возвращением, {name}!\n\n"
-            "Команды:\n"
-            "📚 /words — список слов текущего урока\n"
-            "✅ /test — проверить слова\n"
+            "📚 /words — слова последнего урока\n"
+            "✅ /test — случайный тест\n"
             "📊 /stats — мой прогресс"
+        )
+        return
+
+    if is_admin(data, uid):
+        await update.message.reply_text(
+            "👩 Вы уже зарегистрированы как мама.\n\n"
+            "➕ /addwords — добавить слова урока\n"
+            "📊 /report — прогресс детей"
         )
         return
 
@@ -52,51 +57,39 @@ async def cmd_start(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         [InlineKeyboardButton("Я — мама 👩", callback_data="register_mama")],
     ]
     await update.message.reply_text(
-        "Привет! Это бот-тренажёр слов для курса английского языка 🇬🇧\n\n"
-        "Кто ты?",
+        "Привет! Это бот-тренажёр слов для курса английского языка 🇬🇧\n\nКто ты?",
         reply_markup=InlineKeyboardMarkup(keyboard)
     )
 
-# ─── Registration callback ──────────────────────────────────────────────────────
+# ─── Registration ───────────────────────────────────────────────────────────────
 async def cb_register(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
     await query.answer()
     data = load_data()
     uid = query.from_user.id
-    choice = query.data  # register_ibrahim / register_muhammad / register_mama
+    choice = query.data
 
     if choice == "register_mama":
         data["admin_ids"] = list(set(data.get("admin_ids", []) + [uid]))
         save_data(data)
         await query.edit_message_text(
-            "✅ Вы зарегистрированы как мама (администратор).\n\n"
-            "Команды:\n"
-            "➕ /addwords — добавить слова после урока\n"
+            "✅ Вы зарегистрированы как мама.\n\n"
+            "➕ /addwords — добавить слова урока\n"
             "📊 /report — прогресс детей"
         )
         return
 
     name = "Ибрахим" if choice == "register_ibrahim" else "Мухаммад"
-    data["students"][str(uid)] = {
-        "name": name,
-        "lessons": {}       # lesson_id → [{"en": ..., "ru": ...}, ...]
-    }
+    data["students"][str(uid)] = {"name": name, "lessons": {}}
     save_data(data)
     await query.edit_message_text(
-        f"✅ Привет, {name}! Теперь ты зарегистрирован.\n\n"
+        f"✅ Привет, {name}! Ты зарегистрирован.\n\n"
         "После каждого урока мама добавит сюда слова.\n"
-        "Потом ты сможешь:\n"
         "📚 /words — посмотреть слова\n"
         "✅ /test — пройти тест"
     )
 
-# ─── /addwords (admin only) ─────────────────────────────────────────────────────
-# Usage: reply to a student or choose via buttons, then paste word list
-# Format mama sends:
-#   /addwords Ibrahim 7
-#   to admire — восхищаться
-#   magnificent — великолепный
-#   ...
+# ─── /addwords — шаг 1: выбор ученика ─────────────────────────────────────────
 async def cmd_addwords(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     data = load_data()
     uid = update.effective_user.id
@@ -105,66 +98,180 @@ async def cmd_addwords(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_text("❌ Эта команда только для мамы.")
         return
 
-    # Parse: /addwords <Ibrahim|Muhammad> <lesson_number>
-    # Then words on next lines
-    full_text = update.message.text or ""
-    lines = [l.strip() for l in full_text.strip().split("\n") if l.strip()]
+    students = data.get("students", {})
+    if not students:
+        await update.message.reply_text("❌ Ученики ещё не зарегистрированы.")
+        return
 
-    if len(lines) < 3:
-        await update.message.reply_text(
-            "📋 Формат добавления слов:\n\n"
-            "<code>/addwords Ибрахим 7\n"
-            "to admire — восхищаться\n"
-            "magnificent — великолепный\n"
-            "to explore — исследовать</code>\n\n"
-            "Ученик: <b>Ибрахим</b> или <b>Мухаммад</b>\n"
-            "После тире — русский перевод.",
+    keyboard = [
+        [InlineKeyboardButton(f"👦 {s['name']}", callback_data=f"addw_student_{sid}")]
+        for sid, s in students.items()
+    ]
+    await update.message.reply_text(
+        "➕ Добавление слов урока\n\nДля кого слова?",
+        reply_markup=InlineKeyboardMarkup(keyboard)
+    )
+
+# ─── Шаг 2: выбор номера урока (динамические кнопки) ──────────────────────────
+async def cb_addw_student(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+    await query.answer()
+    data = load_data()
+
+    student_id = query.data.replace("addw_student_", "")
+    student = data["students"].get(student_id)
+    if not student:
+        await query.edit_message_text("❌ Ученик не найден.")
+        return
+
+    ctx.user_data["addw_student_id"] = student_id
+    name = student["name"]
+
+    # Находим последний урок
+    lessons = student.get("lessons", {})
+    last = max((int(k) for k in lessons.keys()), default=0)
+
+    # 5 кнопок вокруг последнего урока + следующий
+    if last == 0:
+        nums = [1, 2, 3, 4, 5]
+    else:
+        start = max(1, last - 1)
+        nums = list(range(start, start + 5))
+
+    row = [InlineKeyboardButton(str(n), callback_data=f"addw_lesson_{n}") for n in nums]
+    buttons = [
+        row,
+        [InlineKeyboardButton("✏️ Ввести номер вручную", callback_data="addw_lesson_manual")]
+    ]
+
+    last_info = f"Последний урок в базе: #{last}" if last > 0 else "Уроков ещё нет"
+    await query.edit_message_text(
+        f"👦 Ученик: <b>{name}</b>\n📌 {last_info}\n\nНомер урока?",
+        reply_markup=InlineKeyboardMarkup(buttons),
+        parse_mode="HTML"
+    )
+
+# ─── Шаг 3а: выбрали номер кнопкой ───────────────────────────────────────────
+async def cb_addw_lesson(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+    await query.answer()
+    data = load_data()
+
+    raw = query.data.replace("addw_lesson_", "")
+
+    # Нажали "ввести вручную"
+    if raw == "manual":
+        ctx.user_data["addw_waiting_lesson_number"] = True
+        student_id = ctx.user_data.get("addw_student_id")
+        name = data["students"].get(student_id, {}).get("name", "")
+        await query.edit_message_text(
+            f"👦 Ученик: <b>{name}</b>\n\nНапиши номер урока цифрой:",
             parse_mode="HTML"
         )
         return
 
-    header = lines[0]  # /addwords Ибрахим 7
-    parts = header.split()
-    if len(parts) < 3:
-        await update.message.reply_text("❌ Укажи имя ученика и номер урока.\nПример: /addwords Ибрахим 7")
+    await _ask_for_words(query, ctx, data, raw)
+
+# ─── Шаг 3б: ввели номер вручную ─────────────────────────────────────────────
+async def handle_manual_lesson(update: Update, ctx: ContextTypes.DEFAULT_TYPE, data: dict):
+    text = update.message.text.strip()
+    if not text.isdigit():
+        await update.message.reply_text("❌ Введи просто цифру, например: 12")
         return
 
-    student_name = parts[1]  # Ибрахим / Мухаммад
-    lesson_id = parts[2]     # 7
+    ctx.user_data.pop("addw_waiting_lesson_number", None)
+    await _ask_for_words_msg(update, ctx, data, text)
 
-    # Find student by name
-    target_uid = None
-    for sid, sdata in data["students"].items():
-        if sdata["name"].lower() == student_name.lower():
-            target_uid = sid
-            break
-
-    if not target_uid:
-        await update.message.reply_text(f"❌ Ученик «{student_name}» не найден. Проверь имя.")
+# ─── Общая функция: подтверждение и ожидание списка слов ──────────────────────
+async def _ask_for_words(query, ctx, data, lesson_id: str):
+    student_id = ctx.user_data.get("addw_student_id")
+    if not student_id:
+        await query.edit_message_text("❌ Что-то пошло не так. Начни заново — /addwords")
         return
 
-    # Parse word pairs
+    student = data["students"].get(student_id)
+    if not student:
+        await query.edit_message_text("❌ Ученик не найден.")
+        return
+
+    name = student["name"]
+    ctx.user_data["addw_lesson_id"] = lesson_id
+    ctx.user_data["addw_waiting"] = True
+
+    existing = student.get("lessons", {}).get(lesson_id)
+    note = f"\n⚠️ Урок #{lesson_id} уже есть ({len(existing)} слов) — слова заменятся." if existing else ""
+
+    await query.edit_message_text(
+        f"👦 Ученик: <b>{name}</b>\n"
+        f"📚 Урок: <b>#{lesson_id}</b>{note}\n\n"
+        f"Теперь отправь список слов:\n\n"
+        f"<code>to admire — восхищаться\n"
+        f"magnificent — великолепный\n"
+        f"to explore — исследовать</code>",
+        parse_mode="HTML"
+    )
+
+async def _ask_for_words_msg(update, ctx, data, lesson_id: str):
+    student_id = ctx.user_data.get("addw_student_id")
+    student = data["students"].get(student_id)
+    name = student["name"]
+    ctx.user_data["addw_lesson_id"] = lesson_id
+    ctx.user_data["addw_waiting"] = True
+
+    existing = student.get("lessons", {}).get(lesson_id)
+    note = f"\n⚠️ Урок #{lesson_id} уже есть ({len(existing)} слов) — слова заменятся." if existing else ""
+
+    await update.message.reply_text(
+        f"👦 Ученик: <b>{name}</b>\n"
+        f"📚 Урок: <b>#{lesson_id}</b>{note}\n\n"
+        f"Теперь отправь список слов:\n\n"
+        f"<code>to admire — восхищаться\n"
+        f"magnificent — великолепный</code>",
+        parse_mode="HTML"
+    )
+
+# ─── Шаг 4: получаем и сохраняем список слов ──────────────────────────────────
+async def handle_addw_words(update: Update, ctx: ContextTypes.DEFAULT_TYPE, data: dict):
+    text = update.message.text.strip()
+    student_id = ctx.user_data.get("addw_student_id")
+    lesson_id = ctx.user_data.get("addw_lesson_id")
+
+    if not student_id or not lesson_id:
+        await update.message.reply_text("❌ Что-то пошло не так. Начни заново — /addwords")
+        ctx.user_data.clear()
+        return
+
+    lines = [l.strip() for l in text.split("\n") if l.strip()]
     words = []
-    for line in lines[1:]:
-        if "—" in line:
-            en, ru = line.split("—", 1)
-        elif "-" in line:
-            en, ru = line.split("-", 1)
-        else:
-            continue
-        words.append({"en": en.strip(), "ru": ru.strip()})
+    for line in lines:
+        for sep in ["—", " - "]:
+            if sep in line:
+                en, ru = line.split(sep, 1)
+                words.append({"en": en.strip(), "ru": ru.strip()})
+                break
 
     if not words:
-        await update.message.reply_text("❌ Не нашла ни одного слова. Проверь формат:\nto admire — восхищаться")
+        await update.message.reply_text(
+            "❌ Не нашла ни одного слова. Проверь формат:\n\n"
+            "<code>to admire — восхищаться\nmagnificent — великолепный</code>",
+            parse_mode="HTML"
+        )
         return
 
-    data["students"][target_uid]["lessons"][lesson_id] = words
+    name = data["students"][student_id]["name"]
+    data["students"][student_id].setdefault("lessons", {})[lesson_id] = words
     save_data(data)
 
-    name = data["students"][target_uid]["name"]
+    ctx.user_data.pop("addw_waiting", None)
+    ctx.user_data.pop("addw_student_id", None)
+    ctx.user_data.pop("addw_lesson_id", None)
+
+    word_list = "\n".join(f"• {w['en']} — {w['ru']}" for w in words)
     await update.message.reply_text(
-        f"✅ Добавлено {len(words)} слов для {name}, урок #{lesson_id}!\n\n"
-        + "\n".join(f"• {w['en']} — {w['ru']}" for w in words)
+        f"✅ Сохранено <b>{len(words)} слов</b> для {name}, урок #{lesson_id}!\n\n"
+        f"{word_list}\n\n"
+        f"Добавить ещё? → /addwords",
+        parse_mode="HTML"
     )
 
 # ─── /words ────────────────────────────────────────────────────────────────────
@@ -182,15 +289,12 @@ async def cmd_words(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_text("📭 Слов пока нет. После урока мама добавит их сюда!")
         return
 
-    # Show latest lesson
-    latest_lesson = max(lessons.keys(), key=lambda x: int(x))
-    words = lessons[latest_lesson]
+    latest = max(lessons.keys(), key=lambda x: int(x))
+    words = lessons[latest]
 
-    text = f"📚 Слова урока #{latest_lesson}:\n\n"
-    for w in words:
-        text += f"🔹 {w['en']} — {w['ru']}\n"
-    text += f"\nВсего: {len(words)} слов\n\nГотов проверить себя? → /test"
-
+    text = f"📚 Слова урока #{latest}:\n\n"
+    text += "\n".join(f"🔹 {w['en']} — {w['ru']}" for w in words)
+    text += f"\n\nВсего: {len(words)} слов\n\nГотов проверить себя? → /test"
     await update.message.reply_text(text)
 
 # ─── /test ─────────────────────────────────────────────────────────────────────
@@ -208,96 +312,69 @@ async def cmd_test(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_text("📭 Слов пока нет. После урока мама добавит их сюда!")
         return
 
-    # Collect all words from all lessons
-    all_words = []
-    for lesson_words in lessons.values():
-        all_words.extend(lesson_words)
-
-    if not all_words:
-        await update.message.reply_text("Слов нет!")
-        return
-
-    # Pick random word
+    all_words = [w for lesson_words in lessons.values() for w in lesson_words]
     word = random.choice(all_words)
-
-    # Randomly choose direction: EN→RU or RU→EN
     direction = random.choice(["en_to_ru", "ru_to_en"])
 
     if direction == "en_to_ru":
-        question = word["en"]
+        prompt = f"🇬🇧 Переведи на русский:\n\n<b>{word['en']}</b>"
         answer = word["ru"]
-        prompt = f"🇬🇧 Переведи на русский:\n\n<b>{question}</b>"
     else:
-        question = word["ru"]
+        prompt = f"🇷🇺 Переведи на английский:\n\n<b>{word['ru']}</b>"
         answer = word["en"]
-        prompt = f"🇷🇺 Переведи на английский:\n\n<b>{question}</b>"
 
-    # Save current question in user context
-    ctx.user_data["test"] = {
-        "answer": answer.lower().strip(),
-        "question": question,
-        "direction": direction,
-        "word": word,
-    }
-
+    ctx.user_data["test"] = {"answer": answer.lower().strip(), "word": word}
     await update.message.reply_text(prompt, parse_mode="HTML")
 
-# ─── Handle test answers ────────────────────────────────────────────────────────
+# ─── Handle all messages ───────────────────────────────────────────────────────
 async def handle_message(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     data = load_data()
     uid = update.effective_user.id
     text = update.message.text.strip()
 
-    # Check if admin is adding words via plain text (shouldn't happen, but guard)
+    # Мама
     if is_admin(data, uid):
-        await update.message.reply_text(
-            "Для добавления слов используй команду:\n"
-            "<code>/addwords Ибрахим 7\n"
-            "to admire — восхищаться\n"
-            "magnificent — великолепный</code>",
-            parse_mode="HTML"
-        )
+        if ctx.user_data.get("addw_waiting"):
+            await handle_addw_words(update, ctx, data)
+        elif ctx.user_data.get("addw_waiting_lesson_number"):
+            await handle_manual_lesson(update, ctx, data)
+        else:
+            await update.message.reply_text(
+                "Команды для мамы:\n"
+                "➕ /addwords — добавить слова урока\n"
+                "📊 /report — прогресс детей"
+            )
         return
 
-    # If there's an active test question
+    # Ученик — активный тест
     if "test" in ctx.user_data:
         test = ctx.user_data.pop("test")
         correct = test["answer"]
         word = test["word"]
-
-        # Flexible check: accept if answer is contained or close enough
         user_answer = text.lower().strip()
-        is_correct = (
-            user_answer == correct or
-            correct in user_answer or
-            user_answer in correct
-        )
 
-        if is_correct:
-            # Update stats
-            student = get_student(data, uid)
-            if student:
-                stats = student.setdefault("stats", {"correct": 0, "wrong": 0, "streak": 0})
+        is_correct = (user_answer == correct or correct in user_answer or user_answer in correct)
+
+        student = get_student(data, uid)
+        if student:
+            stats = student.setdefault("stats", {"correct": 0, "wrong": 0, "streak": 0})
+            if is_correct:
                 stats["correct"] += 1
                 stats["streak"] = stats.get("streak", 0) + 1
-                save_data(data)
+            else:
+                stats["wrong"] += 1
+                stats["streak"] = 0
+            save_data(data)
+
+        if is_correct:
             streak = data["students"][str(uid)]["stats"]["streak"]
             streak_msg = f" 🔥 Серия: {streak}!" if streak >= 3 else ""
-
             await update.message.reply_text(
                 f"✅ Правильно!{streak_msg}\n\n"
                 f"🔹 {word['en']} — {word['ru']}\n\n"
-                "Следующее слово → /test\nВсе слова → /words"
+                "Следующее слово → /test"
             )
         else:
-            # Update stats
-            student = get_student(data, uid)
-            if student:
-                stats = student.setdefault("stats", {"correct": 0, "wrong": 0, "streak": 0})
-                stats["wrong"] += 1
-                stats["streak"] = 0
-                save_data(data)
-
             await update.message.reply_text(
                 f"❌ Почти! Правильный ответ:\n\n"
                 f"🔹 {word['en']} — {word['ru']}\n\n"
@@ -305,7 +382,6 @@ async def handle_message(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
             )
         return
 
-    # No active test
     await update.message.reply_text(
         "Команды:\n"
         "📚 /words — слова урока\n"
@@ -326,20 +402,18 @@ async def cmd_stats(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     stats = student.get("stats", {"correct": 0, "wrong": 0, "streak": 0})
     total = stats["correct"] + stats["wrong"]
     pct = round(stats["correct"] / total * 100) if total else 0
-    lessons = student.get("lessons", {})
-    total_words = sum(len(v) for v in lessons.values())
+    total_words = sum(len(v) for v in student.get("lessons", {}).values())
 
-    name = student["name"]
     await update.message.reply_text(
-        f"📊 Статистика — {name}\n\n"
+        f"📊 Статистика — {student['name']}\n\n"
         f"📚 Всего слов в базе: {total_words}\n"
-        f"✅ Правильных ответов: {stats['correct']}\n"
+        f"✅ Правильных: {stats['correct']}\n"
         f"❌ Ошибок: {stats['wrong']}\n"
         f"🎯 Точность: {pct}%\n"
         f"🔥 Текущая серия: {stats.get('streak', 0)}"
     )
 
-# ─── /report (admin only) ───────────────────────────────────────────────────────
+# ─── /report (admin) ───────────────────────────────────────────────────────────
 async def cmd_report(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     data = load_data()
     uid = update.effective_user.id
@@ -355,16 +429,16 @@ async def cmd_report(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
 
     text = "📊 Отчёт по ученикам:\n\n"
     for sid, sdata in students.items():
-        name = sdata["name"]
         stats = sdata.get("stats", {"correct": 0, "wrong": 0, "streak": 0})
         total = stats["correct"] + stats["wrong"]
         pct = round(stats["correct"] / total * 100) if total else 0
-        lessons = sdata.get("lessons", {})
-        total_words = sum(len(v) for v in lessons.values())
+        total_words = sum(len(v) for v in sdata.get("lessons", {}).values())
+        lessons_count = len(sdata.get("lessons", {}))
 
         text += (
-            f"👦 {name}\n"
-            f"  📚 Слов в базе: {total_words}\n"
+            f"👦 {sdata['name']}\n"
+            f"  📚 Уроков в базе: {lessons_count}\n"
+            f"  🔤 Слов всего: {total_words}\n"
             f"  ✅ Правильно: {stats['correct']} / {total} ({pct}%)\n"
             f"  🔥 Серия: {stats.get('streak', 0)}\n\n"
         )
@@ -382,6 +456,8 @@ def main():
     app.add_handler(CommandHandler("addwords", cmd_addwords))
     app.add_handler(CommandHandler("report", cmd_report))
     app.add_handler(CallbackQueryHandler(cb_register, pattern="^register_"))
+    app.add_handler(CallbackQueryHandler(cb_addw_student, pattern="^addw_student_"))
+    app.add_handler(CallbackQueryHandler(cb_addw_lesson, pattern="^addw_lesson_"))
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_message))
 
     print("Bot started...")
