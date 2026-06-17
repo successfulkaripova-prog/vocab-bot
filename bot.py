@@ -1,6 +1,7 @@
 import os
 import json
 import random
+from datetime import datetime, timedelta
 from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
 from telegram.ext import (
     Application, CommandHandler, MessageHandler,
@@ -260,6 +261,7 @@ async def handle_addw_words(update: Update, ctx: ContextTypes.DEFAULT_TYPE, data
 
     name = data["students"][student_id]["name"]
     data["students"][student_id].setdefault("lessons", {})[lesson_id] = words
+    data["students"][student_id].setdefault("lesson_dates", {})[lesson_id] = datetime.now().isoformat()
     save_data(data)
 
     ctx.user_data.pop("addw_waiting", None)
@@ -344,6 +346,51 @@ async def handle_message(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
                 "➕ /addwords — добавить слова урока\n"
                 "📊 /report — прогресс детей"
             )
+        return
+
+    # Ученик — период-тест (еженедельный / ежемесячный)
+    if "period_test" in ctx.user_data:
+        pt = ctx.user_data["period_test"]
+        user_answer = text.lower().strip()
+        correct = pt["answer"]
+        word = pt["words"][pt["index"]]
+        is_correct = (user_answer == correct or correct in user_answer or user_answer in correct)
+
+        if is_correct:
+            pt["correct"] += 1
+            feedback = f"✅ Правильно! {word['en']} — {word['ru']}"
+        else:
+            pt["wrong"] += 1
+            feedback = f"❌ Нет. Правильно: {word['en']} — {word['ru']}"
+
+        pt["index"] += 1
+
+        if pt["index"] >= pt["total"]:
+            # Тест завершён
+            ctx.user_data.pop("period_test")
+            total = pt["total"]
+            correct_count = pt["correct"]
+            pct = round(correct_count / total * 100)
+            label = pt['label']
+            emoji = "🌟 Отлично!" if pct >= 80 else "💪 Нужно повторить!" if pct >= 50 else "📚 Повтори слова ещё раз!"
+            msg = feedback + "\n\n" + f"🏁 {label} завершена!\n\n" + f"📊 Результат: {correct_count} / {total} ({pct}%)\n" + emoji
+            await update.message.reply_text(msg)
+        else:
+            # Следующий вопрос
+            next_word = pt["words"][pt["index"]]
+            direction = random.choice(["en_to_ru", "ru_to_en"])
+            pt["direction"] = direction
+            if direction == "en_to_ru":
+                prompt = f"🇬🇧 {next_word['en']}"
+                pt["answer"] = next_word["ru"].lower().strip()
+            else:
+                prompt = f"🇷🇺 {next_word['ru']}"
+                pt["answer"] = next_word["en"].lower().strip()
+
+            idx = pt['index'] + 1
+            tot = pt['total']
+            next_msg = feedback + "\n\n" + f"Вопрос {idx} / {tot}:\n{prompt}\n\nНапиши перевод:"
+            await update.message.reply_text(next_msg)
         return
 
     # Ученик — активный тест
@@ -455,6 +502,8 @@ def main():
     app.add_handler(CommandHandler("stats", cmd_stats))
     app.add_handler(CommandHandler("addwords", cmd_addwords))
     app.add_handler(CommandHandler("report", cmd_report))
+    app.add_handler(CommandHandler("weeklytest", cmd_weeklytest))
+    app.add_handler(CommandHandler("monthlytest", cmd_monthlytest))
     app.add_handler(CallbackQueryHandler(cb_register, pattern="^register_"))
     app.add_handler(CallbackQueryHandler(cb_addw_student, pattern="^addw_student_"))
     app.add_handler(CallbackQueryHandler(cb_addw_lesson, pattern="^addw_lesson_"))
@@ -465,3 +514,94 @@ def main():
 
 if __name__ == "__main__":
     main()
+
+# ─── Helpers: собрать слова за период ──────────────────────────────────────────
+def get_words_for_period(student: dict, days: int) -> list:
+    """Возвращает слова из уроков добавленных за последние N дней."""
+    lessons = student.get("lessons", {})
+    lesson_dates = student.get("lesson_dates", {})
+    cutoff = datetime.now() - timedelta(days=days)
+
+    words = []
+    for lesson_id, lesson_words in lessons.items():
+        date_str = lesson_dates.get(lesson_id)
+        if date_str:
+            lesson_date = datetime.fromisoformat(date_str)
+            if lesson_date >= cutoff:
+                words.extend(lesson_words)
+        else:
+            # Если дата урока не сохранена — включаем всё (для старых уроков)
+            words.extend(lesson_words)
+    return words
+
+async def run_period_test(update: Update, ctx: ContextTypes.DEFAULT_TYPE, words: list, label: str):
+    """Запускает тест по набору слов с итогом в конце."""
+    if not words:
+        await update.message.reply_text(f"📭 Нет слов для {label} теста.")
+        return
+
+    random.shuffle(words)
+    ctx.user_data["period_test"] = {
+        "words": words,
+        "index": 0,
+        "correct": 0,
+        "wrong": 0,
+        "label": label,
+        "total": len(words),
+    }
+
+    word = words[0]
+    direction = random.choice(["en_to_ru", "ru_to_en"])
+    ctx.user_data["period_test"]["direction"] = direction
+
+    if direction == "en_to_ru":
+        prompt = f"🇬🇧 {word['en']}"
+        ctx.user_data["period_test"]["answer"] = word["ru"].lower().strip()
+    else:
+        prompt = f"🇷🇺 {word['ru']}"
+        ctx.user_data["period_test"]["answer"] = word["en"].lower().strip()
+
+    await update.message.reply_text(
+        f"🧪 {label}\n"
+        f"Всего слов: {len(words)}\n\n"
+        f"Вопрос 1 / {len(words)}:\n{prompt}\n\n"
+        "Напиши перевод:"
+    )
+
+# ─── /weeklytest ───────────────────────────────────────────────────────────────
+async def cmd_weeklytest(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    data = load_data()
+    uid = update.effective_user.id
+    student = get_student(data, uid)
+
+    if not student:
+        await update.message.reply_text("Сначала зарегистрируйся — /start")
+        return
+
+    words = get_words_for_period(student, days=7)
+    if not words:
+        # Если нет слов за 7 дней — берём последние 2 урока
+        lessons = student.get("lessons", {})
+        sorted_lessons = sorted(lessons.keys(), key=lambda x: int(x), reverse=True)[:2]
+        words = [w for lid in sorted_lessons for w in lessons[lid]]
+
+    await run_period_test(update, ctx, words, "📅 Еженедельная проверка")
+
+# ─── /monthlytest ──────────────────────────────────────────────────────────────
+async def cmd_monthlytest(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    data = load_data()
+    uid = update.effective_user.id
+    student = get_student(data, uid)
+
+    if not student:
+        await update.message.reply_text("Сначала зарегистрируйся — /start")
+        return
+
+    words = get_words_for_period(student, days=30)
+    if not words:
+        # Если дат нет — берём все слова из базы
+        lessons = student.get("lessons", {})
+        words = [w for lesson_words in lessons.values() for w in lesson_words]
+
+    await run_period_test(update, ctx, words, "📆 Ежемесячная проверка")
+
