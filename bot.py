@@ -287,7 +287,6 @@ async def handle_addw_words(update: Update, ctx: ContextTypes.DEFAULT_TYPE, data
             if sep in line:
                 en, ru = line.split(sep, 1)
                 # Убираем транскрипцию [ˈɒbstəkl] из английского слова
-                en = re.sub(r"\[.*?\]", "", en).strip()
                 words.append({"en": en.strip(), "ru": ru.strip()})
                 break
 
