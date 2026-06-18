@@ -1,4 +1,5 @@
 import os
+import re
 import json
 import random
 from datetime import datetime, timedelta
@@ -30,6 +31,49 @@ def is_admin(data: dict, user_id: int) -> bool:
 
 def get_all_words(student: dict) -> list:
     return [w for lesson_words in student.get("lessons", {}).values() for w in lesson_words]
+
+def normalize(text: str) -> str:
+    """Нормализует ответ для мягкой проверки."""
+    t = text.lower().strip()
+    # Убираем транскрипцию [ˈɒbstəkl]
+    t = re.sub(r"\[.*?\]", "", t).strip()
+    # Убираем 'to ' в начале английских слов
+    if t.startswith("to "):
+        t = t[3:]
+    # Убираем знаки препинания
+    t = t.strip(".,!?;:-")
+    return t
+
+def is_answer_correct(user_answer: str, correct: str) -> bool:
+    """Мягкая проверка: точное совпадение или совпадение корней."""
+    u = normalize(user_answer)
+    c = normalize(correct)
+
+    if u == c:
+        return True
+
+    # Прямое вхождение
+    if u in c or c in u:
+        return True
+
+    # Сравниваем корни: убираем окончания глаголов RU и EN
+    ru_endings = ["ться", "ать", "ять", "еть", "ить", "уть", "овать", "евать", "ивать",
+                  "тся", "ся", "ть"]
+    en_endings = ["ing", "tion", "ed", "er", "ly", "ness", "ment"]
+
+    def get_root(word, endings):
+        for e in sorted(endings, key=len, reverse=True):
+            if word.endswith(e) and len(word) > len(e) + 2:
+                return word[:-len(e)]
+        return word
+
+    u_root = get_root(u, ru_endings + en_endings)
+    c_root = get_root(c, ru_endings + en_endings)
+
+    if len(u_root) >= 3 and (u_root in c_root or c_root in u_root):
+        return True
+
+    return False
 
 def get_words_for_period(student: dict, days: int) -> list:
     lessons = student.get("lessons", {})
@@ -242,6 +286,8 @@ async def handle_addw_words(update: Update, ctx: ContextTypes.DEFAULT_TYPE, data
         for sep in ["—", " - "]:
             if sep in line:
                 en, ru = line.split(sep, 1)
+                # Убираем транскрипцию [ˈɒbstəkl] из английского слова
+                en = re.sub(r"\[.*?\]", "", en).strip()
                 words.append({"en": en.strip(), "ru": ru.strip()})
                 break
 
@@ -292,7 +338,19 @@ async def cmd_words(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     text += f"\n\nВсего: {len(words)} слов\n\n✅ /test — проверь себя"
     await update.message.reply_text(text)
 
-# ─── /test — случайный тест ────────────────────────────────────────────────────
+# ─── /test — тест по очереди без повторов ─────────────────────────────────────
+def make_test_queue(words: list) -> list:
+    """Каждое слово — один вопрос, направление случайное, перемешано."""
+    queue = []
+    for word in words:
+        direction = random.choice(["en_to_ru", "ru_to_en"])
+        if direction == "en_to_ru":
+            queue.append({"word": word, "prompt": f"🇬🇧 Переведи на русский:\n\n<b>{word['en']}</b>", "answer": word["ru"].lower().strip()})
+        else:
+            queue.append({"word": word, "prompt": f"🇷🇺 Переведи на английский:\n\n<b>{word['ru']}</b>", "answer": word["en"].lower().strip()})
+    random.shuffle(queue)
+    return queue
+
 async def cmd_test(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     data = load_data()
     uid = update.effective_user.id
@@ -307,18 +365,26 @@ async def cmd_test(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_text("📭 Слов пока нет!")
         return
 
-    word = random.choice(all_words)
-    direction = random.choice(["en_to_ru", "ru_to_en"])
+    # Если очередь уже идёт — продолжаем
+    if ctx.user_data.get("test_queue"):
+        q = ctx.user_data["test_queue"]
+        item = q[0]
+        await update.message.reply_text(item["prompt"], parse_mode="HTML")
+        return
 
-    if direction == "en_to_ru":
-        prompt = f"🇬🇧 Переведи на русский:\n\n<b>{word['en']}</b>"
-        answer = word["ru"]
-    else:
-        prompt = f"🇷🇺 Переведи на английский:\n\n<b>{word['ru']}</b>"
-        answer = word["en"]
+    # Новая очередь — все слова, каждое по одному разу
+    queue = make_test_queue(all_words)
+    ctx.user_data["test_queue"] = queue
+    ctx.user_data["test_session"] = {"correct": 0, "wrong": 0, "total": len(queue)}
 
-    ctx.user_data["test"] = {"answer": answer.lower().strip(), "word": word}
-    await update.message.reply_text(prompt, parse_mode="HTML")
+    item = queue[0]
+    total = len(queue)
+    await update.message.reply_text(
+        f"🃏 Начинаем тест! Всего слов: {total}\n"
+        f"Каждое слово — один раз, повторов нет.\n\n"
+        + item["prompt"],
+        parse_mode="HTML"
+    )
 
 # ─── Период-тест: старт ────────────────────────────────────────────────────────
 async def start_period_test(update: Update, ctx: ContextTypes.DEFAULT_TYPE, words: list, label: str):
@@ -418,7 +484,7 @@ async def handle_message(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         user_answer = text.lower().strip()
         correct = pt["answer"]
         word = pt["words"][pt["index"]]
-        is_correct = (user_answer == correct or correct in user_answer or user_answer in correct)
+        is_correct = is_answer_correct(user_answer, correct)
 
         if is_correct:
             pt["correct"] += 1
@@ -458,38 +524,68 @@ async def handle_message(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
             )
         return
 
-    # Обычный тест
-    if "test" in ctx.user_data:
-        test = ctx.user_data.pop("test")
-        word = test["word"]
+    # Обычный тест (очередь без повторов)
+    if "test_queue" in ctx.user_data and ctx.user_data["test_queue"]:
+        queue = ctx.user_data["test_queue"]
+        session = ctx.user_data.get("test_session", {"correct": 0, "wrong": 0, "total": len(queue)})
+        item = queue[0]
+        word = item["word"]
         user_answer = text.lower().strip()
-        correct = test["answer"]
-        is_correct = (user_answer == correct or correct in user_answer or user_answer in correct)
+        correct = item["answer"]
+        is_correct = is_answer_correct(user_answer, correct)
 
+        # Обновляем статистику в БД
         student = get_student(data, uid)
         if student:
             stats = student.setdefault("stats", {"correct": 0, "wrong": 0, "streak": 0})
             if is_correct:
                 stats["correct"] += 1
                 stats["streak"] = stats.get("streak", 0) + 1
+                session["correct"] += 1
             else:
                 stats["wrong"] += 1
                 stats["streak"] = 0
+                session["wrong"] += 1
             save_data(data)
+
+        ctx.user_data["test_session"] = session
 
         if is_correct:
             streak = data["students"][str(uid)]["stats"]["streak"]
             streak_msg = f"  🔥 Серия: {streak}!" if streak >= 3 else ""
+            feedback = f"✅ Правильно!{streak_msg}\n🔹 {word['en']} — {word['ru']}"
+        else:
+            feedback = f"❌ Правильный ответ:\n🔹 {word['en']} — {word['ru']}"
+
+        # Убираем слово из очереди
+        queue.pop(0)
+
+        if not queue:
+            # Тест завершён
+            ctx.user_data.pop("test_queue", None)
+            ctx.user_data.pop("test_session", None)
+            total = session["total"]
+            correct_count = session["correct"]
+            pct = round(correct_count / total * 100) if total else 0
+            emoji = "🌟 Отлично!" if pct >= 80 else "💪 Нужно повторить!" if pct >= 50 else "📚 Повтори слова ещё раз!"
             await update.message.reply_text(
-                f"✅ Правильно!{streak_msg}\n\n"
-                f"🔹 {word['en']} — {word['ru']}\n\n"
-                "Следующее слово → /test"
+                feedback + "\n\n"
+                + f"🏁 Тест завершён!\n"
+                + f"📊 Результат: {correct_count} / {total} ({pct}%)\n"
+                + emoji + "\n\n"
+                + "Начать заново → /test"
             )
         else:
+            # Следующий вопрос
+            next_item = queue[0]
+            remaining = len(queue)
+            total = session["total"]
+            done = total - remaining
             await update.message.reply_text(
-                f"❌ Почти! Правильный ответ:\n\n"
-                f"🔹 {word['en']} — {word['ru']}\n\n"
-                "Попробуй ещё → /test"
+                feedback + f"\n\n"
+                + f"Вопрос {done + 1} / {total}:\n"
+                + next_item["prompt"],
+                parse_mode="HTML"
             )
         return
 
